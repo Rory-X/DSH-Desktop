@@ -1,6 +1,10 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { nativeMenuItemId, scheduleTrailing, upsertContribution } = require('../dist/desktop-seat-state.js')
+const {
+  nativeMenuItemId,
+  scheduleTrailing,
+  upsertContribution,
+} = require('../dist/main/menus/seat-state.js')
 
 function contribution(overrides = {}) {
   return {
@@ -18,10 +22,16 @@ function contribution(overrides = {}) {
 test('identical repeated contributions do not request another native rebuild', () => {
   const rows = []
   assert.equal(upsertContribution(rows, contribution()), true)
-  assert.equal(upsertContribution(rows, contribution({ items: [{ id: 'check', label: 'Check' }] })), false)
+  assert.equal(
+    upsertContribution(rows, contribution({ items: [{ id: 'check', label: 'Check' }] })),
+    false,
+  )
   assert.equal(rows.length, 1)
 
-  assert.equal(upsertContribution(rows, contribution({ items: [{ id: 'check', label: 'Checking…' }] })), true)
+  assert.equal(
+    upsertContribution(rows, contribution({ items: [{ id: 'check', label: 'Checking…' }] })),
+    true,
+  )
   assert.equal(rows.length, 1)
   assert.equal(rows[0].items[0].label, 'Checking…')
 })
@@ -61,12 +71,29 @@ test('a contribution burst retains only the final scheduled rebuild', () => {
   }
 
   let runs = 0
-  const first = scheduleTrailing(null, () => { runs += 1 }, 100, clock)
-  const final = scheduleTrailing(first, () => { runs += 1 }, 100, clock)
+  const first = scheduleTrailing(
+    null,
+    () => {
+      runs += 1
+    },
+    100,
+    clock,
+  )
+  const final = scheduleTrailing(
+    first,
+    () => {
+      runs += 1
+    },
+    100,
+    clock,
+  )
 
   assert.deepEqual(cleared, [first])
   assert.deepEqual(unrefed, [first, final])
-  assert.deepEqual([...pending.values()].map((entry) => entry.delayMs), [100])
+  assert.deepEqual(
+    [...pending.values()].map((entry) => entry.delayMs),
+    [100],
+  )
   pending.get(final).task()
   assert.equal(runs, 1)
 })

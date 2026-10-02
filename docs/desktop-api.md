@@ -1,8 +1,8 @@
 # `window.dshDesktop` 插件契约
 
-这是桌面壳注入到 DSH 网页的标准 API。插件只应依赖这里的形状；菜单、托盘、通知、overlay 窗口与更新**执行**的原生实现都在 Electron 主进程，与打包脚本分开。**更新检测不在壳里**——见下文 `updates`。
+这是桌面壳注入到 DSH 网页的标准 API。插件只应依赖这里的形状；菜单、托盘、通知、overlay 窗口与更新的原生实现都在 Electron 主进程，与打包脚本分开。**更新检测与展示都在壳里**（启动自动查、之后每 6 小时一次），网页只能请求执行。
 
-源码真相：`src/api.ts`（类型）+ `src/preload.ts`（注入）+ `src/ipc.ts`（频道名，插件看不见）。
+源码真相：`src/shared/api.ts`（类型）+ `src/preload.ts`（注入）+ `src/shared/ipc.ts`（频道名，插件看不见）。
 
 普通浏览器没有 `window.dshDesktop`。检测方式：
 
@@ -11,79 +11,62 @@ const desktop = window.dshDesktop
 if (desktop === undefined) return // 非桌面壳，空操作
 ```
 
-四族并列，不要把动作摊到根上，也不要把通知或 overlay 做成席位。其中 `updates` 只做执行——检测在插件里。
+四族并列，不要把动作摊到根上，也不要把通知或 overlay 做成席位。其中 `updates` 只做执行——检测在壳里。
 
-| 族 | 语义 | 寿命 |
-|---|---|---|
-| `updates` | 更新执行（检测已迁到插件 host 半侧） | 一次请求 |
-| `seats` | 持久原生 UI 贡献（菜单 / 托盘） | 跟插件 fiber 同寿 |
-| `notify` | 系统通知 | 弹出 / 替换 / 关掉 |
-| `overlays` | 同源原生小窗（透明置顶等） | 跟贡献窗口同寿 |
+| 族         | 语义                            | 寿命               |
+| ---------- | ------------------------------- | ------------------ |
+| `updates`  | 更新执行（检测在壳里）          | 一次请求           |
+| `seats`    | 持久原生 UI 贡献（菜单 / 托盘） | 跟插件 fiber 同寿  |
+| `notify`   | 系统通知                        | 弹出 / 替换 / 关掉 |
+| `overlays` | 同源原生小窗（透明置顶等）      | 跟贡献窗口同寿     |
 
 主进程不跑 Cordis，也不把 `Menu` / `Tray` / `Notification` / `BrowserWindow` 对象交给网页。点击只回传 `{ contributor, id }`。
 
 ## `updates`
 
-**检测在插件，执行在壳。** 检测（查 GitHub Releases / npm registry、比较版本、定期间隔、
-「跳过该版本」记录）在 [dsh-desktop-update](https://github.com/JustGenius-s/DSH-Plugs)
-插件的 **host 半侧**：它跑在 dsh web host 的 Node 进程里，没有 CORS 限制，也不依赖
-某个窗口开着。插件通过自己的同源路由（`/dsh-desktop-update/state` 等）把结果提供给
-网页。新插件请用那条路。
+**检测与展示在壳，执行也在壳。** 壳启动后自动查一轮：GitHub Releases
+查 App 本体，npm 的 `@deepseek-ai/dsh` dist-tags 查 DSH 运行时——取**所有渠道里
+版本最高的**（上游发 alpha/rc 时不动 `latest`，只看 latest 会漏掉更新的版本）。
+之后每 6 小时一次。结果展示在应用菜单（帮助菜单）里，按运行时当前状态四选一：
 
-壳这族只留只有打包好的桌面应用做得到的事——**执行**：
+| 状态       | 菜单项                         |
+| ---------- | ------------------------------ |
+| 无更新     | 显示已安装的运行时版本号，禁用 |
+| 有更新     | `更新到 DSH 运行时 X`          |
+| 安装中     | `正在更新 DSH 运行时…`，禁用   |
+| 装好待生效 | `重启服务以应用 X`             |
+
+没有任何渠道/开关配置。
+
+网页这一族只剩执行——因为下面每件事都必须由打包好的桌面应用来做：
 
 ```ts
-const version = await desktop.updates.appVersion()   // 壳的打包版本，如 '0.2.0'
-await desktop.updates.downloadApp(url)               // 用系统浏览器打开发布页
-await desktop.updates.updateDsh('0.1.2-alpha.3')     // pnpm 装指定版本
-await desktop.updates.restartWeb()                   // 热重启 dsh web，桌面壳不退出
-desktop.updates.onPrompt((prompt) => { /* 用 DSH Modal 渲染 */ })
+const version = await desktop.updates.appVersion() // 壳的打包版本，如 '0.2.0'
+await desktop.updates.downloadApp() // 用系统浏览器打开发布页
+await desktop.updates.updateDsh('0.1.7-rc.1') // pnpm 装指定版本（省略则装最高的）
+await desktop.updates.restartWeb() // 热重启 dsh web，桌面壳不退出
+desktop.updates.onPrompt((prompt) => {
+  /* 用 DSH Modal 渲染 */
+})
 desktop.updates.ackPrompt(prompt.id)
-desktop.updates.respondPrompt(prompt.id, 'later')    // 或 'restart'
-desktop.updates.relaunch()                           // 重启整个桌面应用
+desktop.updates.respondPrompt(prompt.id, 'later') // 或 'restart'
+desktop.updates.relaunch() // 重启整个桌面应用
 ```
 
 要点：
 
-- `updateDsh` 的目标版本由新插件给出；壳不知道 latest 是什么，也不判断该不该更新。
-- 执行进度不由壳广播。插件的 browser 半侧驱动执行后，把成败回报给它自己的
-  host 半侧（`POST /dsh-desktop-update/exec`），因此进度跨窗口一致，刷新页面也不丢。
-- `downloadApp(url)` 只接受 `https://github.com/` 开头的地址，否则回落到仓库
-  Releases 页——避免网页借壳打开任意 URL。
+- `updateDsh` 省略版本时，壳自己取所有 dist-tag 里最高的那个装上。
+- `downloadApp()` 打开仓库 Releases 页，不接受 URL 参数——避免网页借壳打开任意 URL。
 - `restartWeb()` 只杀掉并拉起 `dsh web` 子进程，再刷新主窗口；Electron 壳、席位、
   托盘都还在。装完 DSH 运行时、或插件配置变了之后，壳会通过 `onPrompt` 推一条
   询问，由插件用 DSH Modal 渲染「稍后 / 立即重启服务」——不是系统原生 dialog，
   也不强制。用户点「稍后」后同一份变更不再烦，再改才再问。
-
-提示的 `ackPrompt` / `respondPrompt` 只接受收到该提示的主窗口主框架。窗口销毁、主框架换文档或 renderer 结束时，旧提示作废并清理计时器；稍后到达的旧 ID 不会重启服务。详见 [生命周期修复验收](/Users/jiahaoqian/proj/DSH-Desktop/docs/lifecycle-reliability-2026-09-30.md)。
-
-### 兼容层（0.1.x 旧插件）
-
-npm 上暂无 `dsh-desktop-update@0.2.0`，已装的插件还是 0.1.x，只认壳侧的这批端点。
-它们保留到 0.2.0 插件发布为止（见 `scripts/install-desktop-plugin.mjs` 的
-`REQUIRED_VERSION`），**新插件不要依赖**：
-
-```ts
-const state = await desktop.updates.getState()
-const stop = desktop.updates.onState((next) => { /* ... */ })
-await desktop.updates.checkNow()
-await desktop.updates.setDshChannel('next')          // 或 'latest' / 'alpha' / 'custom'
-await desktop.updates.skipVersion('app')             // 或 'dsh'
-await desktop.updates.setGate('dsh', false)
-```
-
-兼容层的状态与配置写在 `~/.dsh/settings.yaml` 的 `desktop-update` 分节，壳自己
-watch 并 6 小时轮询一次；`updateDsh()` 不传版本时由壳按当前渠道解析。
-
-浏览器半侧是唯一同时触达两侧（壳的 preload 与 host 的路由）的地方，所以由它
-摆渡两件谁都做不了的事：把壳的版本号交给 host（检测 App 更新要用），把执行
-结果交给 host（进度要共享）。
-
-主进程还监听 `~/.dsh/profiles/web/` 下的 `package.json`、`cordis.patch.yml`、
-`cordis.yml`：配置变了但当前网页服务还没加载时，通过 `onPrompt` 让桌面插件用
-DSH Modal 询问「稍后 / 立即重启服务」（不是系统原生 dialog）。同一份变更点
-「稍后」后不再烦，再改才再问。插件安装/升级、DSH 运行时更新也走同一套询问，
-不强制。`relaunch()` 才会退出并拉起整个桌面应用。
+- 提示的 `ackPrompt` / `respondPrompt` 只接受收到该提示的主窗口主框架。窗口销毁、主框架换文档或 renderer 结束时，旧提示作废并清理计时器；稍后到达的旧 ID 不会重启服务。详见 [生命周期修复验收](./lifecycle-reliability-2026-09-30.md)。
+- `updateDsh()` 由菜单发起，跑 pnpm 要一两分钟，所以全程有回执：开始弹一条系统通知，
+  菜单项同时切成「正在更新」并禁用；装完弹结果，失败弹错误框。
+- 装完若用户选「稍后」，新运行时只是落到磁盘上、跑着的还是旧版。此时壳把它记成
+  **待生效**：菜单项变成「重启服务以应用 X」，不再重复推荐同一个版本；任意入口把
+  网页服务重启起来（含菜单里的「重启 DSH 服务」）都会自动清掉这个状态。
 
 ## `seats`
 
@@ -93,11 +76,9 @@ DSH Modal 询问「稍后 / 立即重启服务」（不是系统原生 dialog）
 await desktop.seats.contribute({
   seat: 'applicationMenu',
   contributor: 'desktop-update',
-  menu: 'app',       // 或 'plugins'
+  menu: 'app', // 或 'plugins'
   order: 20,
-  items: [
-    { id: 'check-now', label: '检查更新…', accelerator: 'CmdOrCtrl+Shift+U' },
-  ],
+  items: [{ id: 'check-now', label: '检查更新…', accelerator: 'CmdOrCtrl+Shift+U' }],
 })
 await desktop.seats.contribute({
   seat: 'tray',
@@ -119,6 +100,15 @@ await desktop.seats.revoke('tray', 'desktop-update')
 - 每份贡献最多 24 项，子菜单深度最多 2
 - 标签最长 120
 - 窗口销毁时该窗口的贡献自动卸掉
+
+**菜单语言**：壳自己的条目（应用菜单、Edit / View / Window，以及 About / Hide / Quit
+这些 role 条目——Electron 的 role 默认文案永远是英文）按 DSH 用户设置里的语言偏好取词
+（web profile 的 `locale.preference`），没设置过时回落系统语言；改语言后壳会立刻重建菜单，
+不需要热重启。
+
+**贡献条目的文案由贡献方自带**：请按 DSH 当前界面语言（`ctx.locale` 的 active，
+*不要*用 `navigator.language`）取词，并在语言变化时用新文案重新 `contribute`
+（同 contributor 覆盖），否则菜单会出现中英混排。
 
 ## `notify`
 
@@ -143,16 +133,18 @@ await desktop.notify.close('desktop-update') // 该 contributor 全部
 - 每个 contributor 最多 3 条同时存在；新 id 间隔至少 10 秒
 - 标题最长 80，正文最长 240
 - 插件卸载时应 `close(contributor)`
+- `onClosed(listener)` 在通知结束（系统提示与壳内横幅均关闭）、主动关闭或被替换时回调；返回取消订阅函数
+- 高频替换同一 `id` 时可传 `instanceId`（与 `id` 相同的格式限制），`onAction` / `onClosed` 会原样带回，便于忽略旧实例的迟到事件
+- 页面整页导航或窗口销毁时，主进程释放该页面的通知、横幅和限流记录
 
-**只有系统横幅一条通路**（macOS 通知中心里的真通知）。壳内自绘浮层已删除——它会在系统通知实际没发出时仍然显示，把失败伪装成成功。
+macOS 打包包在 `Info.plist` 里声明了 `NSUserNotificationAlertStyle=alert`。开发态 `pnpm start` 走 Electron 二进制，通知可能显示为 Electron，系统也可能先问权限。
 
-`shown: true` 现在等系统回执：`notification` 的 `show` 事件到达才算成功，`failed` 事件（例如签名无效）返回 `{ shown: false }`。1.5 秒内既无 `show` 也无 `failed` 时按已投递处理。
-
-macOS 打包包在 `Info.plist` 里声明了 `NSUserNotificationAlertStyle=alert`。开发态 `pnpm start` 走 Electron 二进制，系统可能先问权限。
+系统横幅能弹出来要求 app 有有效 bundle 签名：只带 Electron 自带 linker 签名（identifier=`Electron`、Info.plist 未绑定）的包会被 `usernotificationsd` 拒绝 `addRequest`，只回一个 `UNErrorDomain 1`。打包配置见 [signing-and-notarization.md](./signing-and-notarization.md)。
 
 网页里的 `new Notification()`（例如 `dsh-notification` 插件）由主窗口 preload 接到本族原生通知。Chromium 自己的 Notification API 在桌面壳里会显示已授权、却不向系统申请 UNUserNotificationCenter，横幅被静默丢掉。
 
-系统横幅能弹出来**要求 app 有有效 bundle 签名**：只带 Electron 自带 linker 签名（identifier=`Electron`、Info.plist 未绑定）的包会被 `usernotificationsd` 拒绝 `addRequest`，只回一个 `UNErrorDomain 1`。打包配置见 `docs/signing-and-notarization.md`。
+通知桥在每次页面加载时由 preload 安装；关闭、失败及替换后的实例会释放。
+`Notification.requestPermission()` 仅查询桥接权限。
 
 ## `overlays`
 

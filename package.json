@@ -7,20 +7,31 @@
   "main": "dist/main.js",
   "license": "MIT",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs",
+    "format": "prettier --write src test scripts package.json \"tsconfig*.json\" vitest.config.ts .prettierrc.json",
+    "format:check": "prettier --check src test scripts package.json \"tsconfig*.json\" vitest.config.ts .prettierrc.json",
+    "check": "npm run format:check && npm run typecheck && npm test",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "npm run build && vitest run && node --test \"test/**/*.test.cjs\"",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "npm run build && node --test \"test/**/*.test.cjs\"",
+    "test:watch": "vitest",
     "collect": "node scripts/collect-runtime.mjs",
-    "start": "npm run build && electron .",
-    "dev": "npm run build && electron .",
-    "pack": "npm run build && electron-builder --dir",
+    "start": "npm run build && node scripts/start.mjs",
+    "dev": "npm run start --",
+    "pack": "npm run build && npm run collect && electron-builder --dir",
     "dist:mac": "npm run build && npm run collect && electron-builder --mac",
     "dist:win": "npm run build && npm run collect && electron-builder --win"
   },
   "devDependencies": {
     "@electron/notarize": "^2.5.0",
     "@types/node": "^22.0.0",
-    "electron": "^43.4.0",
+    "electron": "45.0.0-alpha.6",
     "electron-builder": "^26.15.3",
-    "typescript": "^6.0.3"
+    "esbuild": "0.28.2",
+    "prettier": "3.9.9",
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.7"
   },
   "build": {
     "appId": "com.justgenius.dshdesktop",
@@ -34,7 +45,10 @@
       "build/icon-app.png",
       "build/icon-mac.png",
       "build/icon.png",
-      "build/splash.html"
+      "build/splash.html",
+      "build/shell.css",
+      "build/whale.svg",
+      "build/plugin-recovery.html"
     ],
     "extraResources": [
       {
@@ -42,16 +56,8 @@
         "to": "runtime",
         "filter": [
           "**/*",
-          "!**/*.exe",
           "!**/*.map",
           "!**/pnpm/dist/node_modules/@reflink/**"
-        ]
-      },
-      {
-        "from": "scripts",
-        "to": "scripts",
-        "filter": [
-          "install-desktop-plugin.mjs"
         ]
       },
       {
@@ -60,6 +66,9 @@
       }
     ],
     "asar": true,
+    "electronFuses": {
+      "runAsNode": true
+    },
     "electronLanguages": [
       "en",
       "zh_CN"
@@ -70,6 +79,9 @@
       "extendInfo": {
         "NSUserNotificationAlertStyle": "alert",
         "NSMicrophoneUsageDescription": "DSH-Desktop 使用麦克风进行语音输入。",
+        "LSEnvironment": {
+          "NODE_OPTIONS": "--no-use-system-ca"
+        },
         "LSUIElement": false
       },
       "category": "public.app-category.developer-tools",
@@ -86,6 +98,10 @@
     },
     "win": {
       "icon": "build/icon.ico",
+      "electronLanguages": [
+        "en-US",
+        "zh-CN"
+      ],
       "target": [
         "nsis",
         "zip"

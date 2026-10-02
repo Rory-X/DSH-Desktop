@@ -1,6 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { installDshMicrophonePermission } = require('../dist/desktop-microphone.js')
+const { installDshMicrophonePermission } = require('../dist/main/platform/microphone.js')
 
 const origin = 'http://127.0.0.1:43123'
 
@@ -8,30 +8,48 @@ function setup(platform = 'linux', askForMicrophone = async () => true) {
   const mainWebContents = {
     currentUrl: `${origin}/?token=secret`,
     destroyed: false,
-    getURL() { return this.currentUrl },
-    isDestroyed() { return this.destroyed },
+    getURL() {
+      return this.currentUrl
+    },
+    isDestroyed() {
+      return this.destroyed
+    },
   }
   const ses = {
-    setPermissionCheckHandler(handler) { this.check = handler },
-    setPermissionRequestHandler(handler) { this.request = handler },
+    setPermissionCheckHandler(handler) {
+      this.check = handler
+    },
+    setPermissionRequestHandler(handler) {
+      this.request = handler
+    },
   }
   let dshOrigin = origin
   installDshMicrophonePermission(ses, mainWebContents, () => dshOrigin, platform, askForMicrophone)
-  const request = (webContents = mainWebContents, details = {}) => new Promise((resolve) => {
-    ses.request(webContents, 'media', resolve, {
+  const request = (webContents = mainWebContents, details = {}) =>
+    new Promise((resolve) => {
+      ses.request(webContents, 'media', resolve, {
+        requestingUrl: `${origin}/chat`,
+        securityOrigin: origin,
+        mediaTypes: ['audio'],
+        ...details,
+      })
+    })
+  const check = (webContents = mainWebContents, details = {}) =>
+    ses.check(webContents, 'media', origin, {
+      mediaType: 'audio',
+      isMainFrame: true,
       requestingUrl: `${origin}/chat`,
-      securityOrigin: origin,
-      mediaTypes: ['audio'],
       ...details,
     })
-  })
-  const check = (webContents = mainWebContents, details = {}) => ses.check(
-    webContents,
-    'media',
-    origin,
-    { mediaType: 'audio', isMainFrame: true, requestingUrl: `${origin}/chat`, ...details },
-  )
-  return { ses, mainWebContents, request, check, setDshOrigin: (value) => { dshOrigin = value } }
+  return {
+    ses,
+    mainWebContents,
+    request,
+    check,
+    setDshOrigin: (value) => {
+      dshOrigin = value
+    },
+  }
 }
 
 test('only the current DSH window and same-origin audio frame can use the microphone', async () => {
@@ -45,7 +63,10 @@ test('only the current DSH window and same-origin audio frame can use the microp
   assert.equal(check(mainWebContents, { mediaType: 'video' }), false)
   assert.equal(await request(mainWebContents, { mediaTypes: ['audio', 'video'] }), false)
   assert.equal(await request(mainWebContents, { mediaTypes: ['video'] }), false)
-  assert.equal(await request(mainWebContents, { requestingUrl: 'https://example.com/frame' }), false)
+  assert.equal(
+    await request(mainWebContents, { requestingUrl: 'https://example.com/frame' }),
+    false,
+  )
   assert.equal(check(mainWebContents, { securityOrigin: 'https://example.com' }), false)
 })
 
@@ -65,7 +86,10 @@ test('old origin and navigated or destroyed window lose microphone access', asyn
 
 test('macOS asks on demand and honors system denial', async () => {
   let calls = 0
-  const { request } = setup('darwin', async () => { calls++; return false })
+  const { request } = setup('darwin', async () => {
+    calls++
+    return false
+  })
   assert.equal(calls, 0)
   assert.equal(await request(), false)
   assert.equal(calls, 1)
@@ -76,7 +100,9 @@ test('concurrent macOS audio requests share one system prompt', async () => {
   let resolvePrompt
   const { request } = setup('darwin', () => {
     calls++
-    return new Promise((resolve) => { resolvePrompt = resolve })
+    return new Promise((resolve) => {
+      resolvePrompt = resolve
+    })
   })
   const first = request()
   const second = request()
@@ -96,7 +122,13 @@ test('non-media permissions retain the previous Electron behavior', async () => 
 
 test('macOS rechecks the page when the system prompt completes', async () => {
   let resolvePrompt
-  const { mainWebContents, request } = setup('darwin', () => new Promise((resolve) => { resolvePrompt = resolve }))
+  const { mainWebContents, request } = setup(
+    'darwin',
+    () =>
+      new Promise((resolve) => {
+        resolvePrompt = resolve
+      }),
+  )
   const result = request()
   mainWebContents.currentUrl = 'https://example.com/'
   resolvePrompt(true)

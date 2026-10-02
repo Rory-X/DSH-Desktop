@@ -1,0 +1,210 @@
+const { test } = require('node:test')
+const assert = require('node:assert/strict')
+const { EventEmitter } = require('node:events')
+const { readFileSync } = require('node:fs')
+const { join } = require('node:path')
+const { runInNewContext } = require('node:vm')
+const { Ipc } = require('../../dist/shared/ipc.js')
+
+function loadPreload(invoke = async () => ({ shown: true })) {
+  const reportedErrors = []
+  const page = { reportError: (error) => reportedErrors.push(error) }
+  const calls = []
+  const instanceMaps = []
+  class InstanceMap extends Map {
+    constructor(...args) {
+      super(...args)
+      instanceMaps.push(this)
+    }
+  }
+  const ipcRenderer = new EventEmitter()
+  ipcRenderer.invoke = async (...args) => {
+    calls.push(args)
+    return invoke(...args)
+  }
+  ipcRenderer.send = (...args) => calls.push(args)
+  const electron = {
+    ipcRenderer,
+    webFrame: {
+      executeJavaScript: () => Promise.resolve(),
+    },
+    contextBridge: {
+      exposeInMainWorld: (name, api) => {
+        page[name] = api
+      },
+      executeInMainWorld: ({ func, args }) => {
+        return runInNewContext(`(${func.toString()})(...args)`, {
+          args,
+          window: page,
+          Event,
+          Map: InstanceMap,
+          Date: { now: () => 12345 },
+        })
+      },
+    },
+  }
+  runInNewContext(readFileSync(join(__dirname, '../../dist/preload.js'), 'utf8'), {
+    exports: {},
+    process,
+    require: (name) => {
+      assert.equal(name, 'electron', 'sandboxed preload cannot require local modules')
+      return electron
+    },
+  })
+  return {
+    page,
+    api: page.dshDesktop,
+    calls,
+    ipcRenderer,
+    instances: instanceMaps[0],
+    reportedErrors,
+  }
+}
+
+test('desktop event subscriptions forward payloads and can be removed', () => {
+  const { api, ipcRenderer } = loadPreload()
+  const received = []
+  const unsubscribe = api.seats.onAction((action) => received.push(action))
+  const action = { contributor: 'plugin', seat: 'tray', id: 'open' }
+  ipcRenderer.emit(Ipc.seats.action, {}, action)
+  unsubscribe()
+  ipcRenderer.emit(Ipc.seats.action, {}, action)
+  assert.deepEqual(received, [action])
+})
+
+test('untagged notifications in the same millisecond keep separate IDs and instances', () => {
+  const { page, calls, instances } = loadPreload()
+  new page.Notification('First')
+  new page.Notification('Second')
+  assert.notEqual(calls[0][1].id, calls[1][1].id)
+  assert.equal(instances.size, 2)
+})
+
+test('closing a notification releases it once and ignores subsequent native events', () => {
+  const { page, calls, ipcRenderer, instances } = loadPreload()
+  const note = new page.Notification('Title', { tag: 'message' })
+  const spec = calls[0][1]
+  let clicks = 0
+  let closes = 0
+  note.onclick = () => clicks++
+  note.onclose = () => closes++
+  note.close()
+  note.close()
+  ipcRenderer.emit(Ipc.notify.action, {}, spec)
+  ipcRenderer.emit(Ipc.notify.closed, {}, spec)
+  assert.equal(instances.size, 0)
+  assert.equal(clicks, 0)
+  assert.equal(closes, 1)
+  assert.deepEqual(calls[1], [Ipc.notify.close, 'web-notification', spec.id])
+  assert.equal(calls.length, 2)
+})
+
+test('same-tag replacement ignores old instance events, close calls, and pending show results', async () => {
+  const pending = []
+  const { page, calls, ipcRenderer, instances } = loadPreload(
+    () => new Promise((resolve, reject) => pending.push({ resolve, reject })),
+  )
+  const old = new page.Notification('Old', { tag: 'message' })
+  let oldCloses = 0
+  let oldErrors = 0
+  old.onclose = () => oldCloses++
+  old.onerror = () => oldErrors++
+  const current = new page.Notification('Current', { tag: 'message' })
+  const firstSpec = calls[0][1]
+  const currentSpec = calls[1][1]
+  let currentClicks = 0
+  let currentCloses = 0
+  let currentShows = 0
+  current.onclick = () => currentClicks++
+  current.onclose = () => currentCloses++
+  current.onshow = () => currentShows++
+  assert.equal(oldCloses, 1)
+  old.close()
+  assert.equal(
+    calls.length,
+    2,
+    'the replaced instance cannot close the current same-tag native notification',
+  )
+  ipcRenderer.emit(Ipc.notify.action, {}, firstSpec)
+  ipcRenderer.emit(Ipc.notify.closed, {}, firstSpec)
+  pending[0].reject(new Error('old invocation failed'))
+  pending[1].resolve({ shown: true })
+  await new Promise(setImmediate)
+  assert.equal(oldErrors, 0)
+  assert.equal(currentShows, 1)
+  assert.equal(currentClicks, 0)
+  assert.equal(currentCloses, 0)
+  ipcRenderer.emit(Ipc.notify.action, {}, currentSpec)
+  ipcRenderer.emit(Ipc.notify.closed, {}, currentSpec)
+  assert.equal(currentClicks, 1)
+  assert.equal(currentCloses, 1)
+  assert.equal(instances.size, 0)
+})
+
+test('native close and failed show results release browser notification instances', async () => {
+  for (const invoke of [
+    async () => ({ shown: false }),
+    async () => {
+      throw new Error('IPC failed')
+    },
+  ]) {
+    const { page, instances } = loadPreload(invoke)
+    const note = new page.Notification('Failed', { tag: 'failed' })
+    let errors = 0
+    note.onerror = () => errors++
+    await new Promise(setImmediate)
+    assert.equal(errors, 1)
+    assert.equal(instances.size, 0)
+  }
+  const { page, calls, ipcRenderer, instances } = loadPreload()
+  const note = new page.Notification('Closed by system', { tag: 'closed' })
+  let closes = 0
+  note.onclose = () => closes++
+  ipcRenderer.emit(Ipc.notify.closed, {}, calls[0][1])
+  assert.equal(closes, 1)
+  assert.equal(instances.size, 0)
+})
+
+test('a replacement created by an onclose handler stays the newest notification', () => {
+  const { page, calls, instances } = loadPreload()
+  const first = new page.Notification('First', { tag: 'message' })
+  let newest
+  first.onclose = function () {
+    assert.equal(this, first)
+    newest = new page.Notification('Newest', { tag: 'message' })
+  }
+  new page.Notification('Superseded inside close handler', { tag: 'message' })
+  assert.equal(calls.length, 2)
+  assert.equal(calls[1][1].title, 'Newest')
+  assert.equal(instances.get('message'), newest)
+})
+
+test('throwing notification handlers report errors without aborting replacement or cleanup', async () => {
+  const { page, calls, ipcRenderer, instances, reportedErrors } = loadPreload()
+  const first = new page.Notification('First', { tag: 'message' })
+  const closeError = new Error('old close listener failed')
+  first.onclose = () => {
+    throw closeError
+  }
+  const current = new page.Notification('Current', { tag: 'message' })
+  assert.equal(calls.length, 2, 'replacement must still reach the native notification service')
+
+  const showError = new Error('show listener failed')
+  current.onshow = () => {
+    throw showError
+  }
+  await new Promise(setImmediate)
+  assert.equal(
+    instances.get('message'),
+    current,
+    'a page handler failure does not end the native notification',
+  )
+
+  const clickError = new Error('click listener failed')
+  current.onclick = () => {
+    throw clickError
+  }
+  ipcRenderer.emit(Ipc.notify.action, {}, calls[1][1])
+  assert.equal(instances.size, 0)
+  assert.deepEqual(reportedErrors, [closeError, showError, clickError])
+})

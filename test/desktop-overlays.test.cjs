@@ -5,16 +5,20 @@ const { readFileSync } = require('node:fs')
 const { createRequire } = require('node:module')
 const { join } = require('node:path')
 const vm = require('node:vm')
-const { Ipc } = require('../dist/ipc')
+const { Ipc } = require('../dist/shared/ipc')
 
 function deferred() {
   let resolve, reject
-  const promise = new Promise((a, b) => { resolve = a; reject = b })
+  const promise = new Promise((a, b) => {
+    resolve = a
+    reject = b
+  })
   return { promise, resolve, reject }
 }
 
 function harness() {
-  const windows = [], handlers = new Map(), auth = []
+  const windows = [],
+    handlers = new Map()
   const owner = Object.assign(new EventEmitter(), { id: 1, isDestroyed: () => false })
   class Window extends EventEmitter {
     constructor(options) {
@@ -33,9 +37,15 @@ function harness() {
       })
       windows.push(this)
     }
-    isDestroyed() { return this.destroyed }
-    getBounds() { return this.bounds }
-    setBounds(bounds) { this.bounds = bounds }
+    isDestroyed() {
+      return this.destroyed
+    }
+    getBounds() {
+      return this.bounds
+    }
+    setBounds(bounds) {
+      this.bounds = bounds
+    }
     setMenuBarVisibility() {}
     setTitle() {}
     setFocusable() {}
@@ -44,14 +54,17 @@ function harness() {
     setSkipTaskbar() {}
     setResizable() {}
     setHasShadow() {}
+    setHiddenInMissionControl() {}
+    setBackgroundColor() {}
+    hide() {}
     loadURL(url) {
       this.url = url
       const load = deferred()
       this.loads.push(load)
       return load.promise
     }
-    showInactive() {
-      assert.equal(this.contentsDestroyed, false, 'would crash native BrowserWindow::ShowInactive')
+    show() {
+      assert.equal(this.contentsDestroyed, false, 'would show a window with destroyed contents')
       this.shows += 1
     }
     close() {
@@ -69,36 +82,40 @@ function harness() {
       getDisplayNearestPoint: () => ({ workArea: area }),
       getCursorScreenPoint: () => ({ x: 0, y: 0 }),
     },
-    session: { fromPartition: () => ({
-      setPermissionRequestHandler() {}, setPermissionCheckHandler() {},
-      fetch(url) {
-        const request = deferred()
-        auth.push({ url, ...request })
-        return request.promise
-      },
-    }) },
   }
-  const path = join(__dirname, '../dist/desktop-overlays.js')
+  const path = join(__dirname, '../dist/main/overlays/manager.js')
   const localRequire = createRequire(path)
   const exports = {}
   const context = {
-    exports, __dirname: join(__dirname, '../dist'), process, URL, Error,
+    exports,
+    __dirname: join(__dirname, '../dist/main/overlays'),
+    process,
+    URL,
+    Error,
     console: { ...console, log() {}, error() {} },
     require(name) {
       if (name === 'electron') return electron
-      if (name === './dock-policy') return { enforceRegularDockPolicy() {} }
-      if (name === './windows') return { setWindowRole() {}, webContentsById() {} }
+      if (name === '../platform/dock-policy') return { enforceRegularDockPolicy() {} }
+      if (name === '../platform/paths') return { preloadPath: () => 'preload.js' }
+      if (name === '../windows/registry') return { setWindowRole() {}, webContentsById() {} }
       return localRequire(name)
     },
   }
   vm.runInNewContext(readFileSync(path, 'utf8'), context, { filename: path })
-  let authUrl = null
-  exports.setupDesktopOverlays(() => 'http://127.0.0.1:12345', () => authUrl)
-  const open = (url = '/overlay', id = 'overlay') => handlers.get(Ipc.overlays.open)({ sender: owner }, {
-    contributor: 'probe', id, url, bounds: { width: 64, height: 64 },
-  })
-  const tick = () => new Promise(resolve => setImmediate(resolve))
-  return { ...exports, windows, auth, open, tick, setAuthUrl: value => { authUrl = value } }
+  exports.setupDesktopOverlays(() => 'http://127.0.0.1:12345')
+  exports.allowOverlays()
+  const open = (url = '/overlay', id = 'overlay') =>
+    handlers.get(Ipc.overlays.open)(
+      { sender: owner },
+      {
+        contributor: 'probe',
+        id,
+        url,
+        bounds: { width: 64, height: 64 },
+      },
+    )
+  const tick = () => new Promise((resolve) => setImmediate(resolve))
+  return { ...exports, windows, open, tick }
 }
 
 test('restart during initial load never shows a window with destroyed contents', async () => {
@@ -137,7 +154,7 @@ test('restart cancels a reused window navigation and any queued reopen', async (
   await initial
   const pending = h.open('/next')
   const queued = h.open('/queued')
-  const rejected = [pending, queued].map(p => assert.rejects(p, /closed while loading/))
+  const rejected = [pending, queued].map((p) => assert.rejects(p, /closed while loading/))
   await h.tick()
   h.closeAllOverlays()
   await Promise.all(rejected)
@@ -164,25 +181,4 @@ test('even a resolved navigation cannot show already-destroyed contents', async 
   h.windows[0].loads[0].resolve()
   await rejected
   assert.equal(h.windows[0].shows, 0)
-})
-
-test('stale auth completion cannot mark the restarted service authenticated', async () => {
-  const h = harness()
-  h.setAuthUrl('http://127.0.0.1:12345/?token=old')
-  const pending = h.open()
-  const rejected = assert.rejects(pending, /closed while loading/)
-  await h.tick()
-  assert.equal(h.auth.length, 1)
-  h.closeAllOverlays()
-  h.auth[0].resolve()
-  await rejected
-  h.setAuthUrl('http://127.0.0.1:12345/?token=new')
-  const next = h.open()
-  await h.tick()
-  assert.equal(h.auth.length, 2)
-  h.auth[1].resolve()
-  await h.tick()
-  h.windows[1].loads[0].resolve()
-  await next
-  assert.equal(h.windows[1].shows, 1)
 })

@@ -8,7 +8,7 @@
 
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { FULLSCREEN_STRIP_INSET_PX, titleBarChromeCSS } = require('../dist/titlebar-chrome.js')
+const { FULLSCREEN_STRIP_INSET_PX, titleBarChromeCSS } = require('../dist/main/windows/titlebar.js')
 
 const mac = titleBarChromeCSS('darwin')
 const macFullscreen = titleBarChromeCSS('darwin', true)

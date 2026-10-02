@@ -1,7 +1,7 @@
 // 标题栏 chrome 注入器的测试。
 //
 // 注入方式已从 `wc.insertCSS` 改为「在页面里维护一个带 id 的 <style>」
-// （原因见 src/titlebar-chrome-controller.ts：insertCSS 的规则在 0.1.7 +
+// （原因见 src/main/windows/titlebar-controller.ts：insertCSS 的规则在 0.1.7 +
 // Electron 43 上不参与最终层叠，压不过上游的作者级规则）。
 //
 // 因此这里不再断言「insertCSS 的调用序列」，而是**真的执行注入脚本**：
@@ -12,8 +12,8 @@ const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
 const vm = require('node:vm')
-const { installTitleBarChrome } = require('../dist/titlebar-chrome-controller.js')
-const { titleBarChromeCSS } = require('../dist/titlebar-chrome.js')
+const { installTitleBarChrome } = require('../dist/main/windows/titlebar-controller.js')
+const { titleBarChromeCSS } = require('../dist/main/windows/titlebar.js')
 
 const STYLE_ID = '__dsh_desktop_titlebar_chrome'
 
@@ -31,10 +31,16 @@ function makeDom() {
     },
     documentElement: {
       attrs: new Set(),
-      setAttribute(name) { this.attrs.add(name) },
-      removeAttribute(name) { this.attrs.delete(name) },
+      setAttribute(name) {
+        this.attrs.add(name)
+      },
+      removeAttribute(name) {
+        this.attrs.delete(name)
+      },
     },
-    getElementById(id) { return elements.get(id) ?? null },
+    getElementById(id) {
+      return elements.get(id) ?? null
+    },
     createElement(tag) {
       return {
         tagName: tag.toUpperCase(),
@@ -79,7 +85,7 @@ function fixture(fullscreen = false) {
 }
 
 async function emitAsync(emitter, event) {
-  await Promise.all(emitter.listeners(event).map(listener => listener()))
+  await Promise.all(emitter.listeners(event).map((listener) => listener()))
 }
 
 /** DOM 桩里当前 <style id=...> 的 CSS 文本。 */
@@ -104,7 +110,7 @@ test('重复刷新只替换内容，不重复追加节点（幂等）', async ()
   await emitAsync(wc, 'did-finish-load')
   await emitAsync(wc, 'did-finish-load')
   await emitAsync(wc, 'did-finish-load')
-  const sameId = dom.created.filter(el => el.id === STYLE_ID)
+  const sameId = dom.created.filter((el) => el.id === STYLE_ID)
   assert.equal(sameId.length, 1, `#${STYLE_ID} 被创建了 ${sameId.length} 次`)
   assert.equal(injectedCSS(dom), titleBarChromeCSS('darwin', false))
 })
@@ -149,7 +155,7 @@ test('非 darwin 平台不写 data-fullscreen，但仍注入样式', async () =>
   }
   installTitleBarChrome(win, 'win32')
   await emitAsync(wc, 'did-finish-load')
-  assert.equal(scripts.filter(c => c.includes('data-fullscreen')).length, 0)
+  assert.equal(scripts.filter((c) => c.includes('data-fullscreen')).length, 0)
   assert.equal(injectedCSS(dom), titleBarChromeCSS('win32', true))
 })
 
@@ -179,7 +185,9 @@ test('脚本执行失败不阻断后续刷新', async () => {
   const { win, wc, dom } = fixture()
   await emitAsync(wc, 'did-finish-load')
   const ok = wc.executeJavaScript
-  wc.executeJavaScript = async () => { throw new Error('navigation in progress') }
+  wc.executeJavaScript = async () => {
+    throw new Error('navigation in progress')
+  }
   win.fullscreen = true
   await emitAsync(win, 'enter-full-screen')
   // 失败不应抛出，也不应污染已有样式
