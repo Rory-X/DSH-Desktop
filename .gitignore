@@ -15,3 +15,7 @@ scripts/probe-app/
 # 手工改过的临时副本
 *.bak-*
 *.v3-debug
+
+# 验证夹具（浏览器实测用）
+.tmp-verify/
+.playwright-mcp/

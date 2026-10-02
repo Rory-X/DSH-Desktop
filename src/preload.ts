@@ -168,6 +168,64 @@ const api: DshDesktop = {
 
 contextBridge.exposeInMainWorld('dshDesktop', api)
 
+// ---------------------------------------------------------------------------
+// 桌面标记：告诉 DSH 网页「我跑在 macOS 原生壳里」
+// ---------------------------------------------------------------------------
+//
+// 上游把「运行在 macOS 桌面壳」这件事编码成一个 DOM 标记，契约写在
+// @deepseek-ai/dsh-client-ui-primitives 里：
+//
+//   Whether the client runs in the macOS desktop shell: the Electron preload
+//   marks `<html>` with `data-platform="darwin"`; plain web never sets it.
+//   Read at render time — the mark may arrive as late as DOMContentLoaded.
+//
+// 「set only by the desktop preload」这句话在 ui-sidebar / ui-layout 两份
+// README 里都重复了一遍，是上游公开的窗口集成契约，不是内部细节。
+//
+// ## 为什么必须由 preload 打，而不是注入 CSS
+//
+// 这个标记门控的不只是样式，还有 JSX 层的条件渲染与列宽计算，二者都
+// 在页面脚本里跑，注入 CSS 改不到：
+//
+//   ui-layout   darwin && <div className={leadingBand} data-shell-leading-band />
+//               —— 全宽 52px 窗口拖拽带，无标记时整个节点不存在
+//   ui-layout   collapsedWidth = darwin ? 0 : 56
+//               —— 收起侧栏时不保留轨道
+//   ui-sidebar  darwinDesktop && <div className={topStrip}>{toggle}</div>
+//               —— 侧栏顶部条与收起按钮
+//
+// 实测（0.1.7-alpha.2，遍历 body 取 app-region: drag 的元素）：
+// 无标记时全页**零个**拖拽区 —— 这正是本壳不得不手写一整套 app-region
+// 规则的原因。接上标记后这些职责交还上游。
+//
+// ## 为什么要在 document-start 就打
+//
+// 上游文档明说「Read at render time — the mark may arrive as late as
+// DOMContentLoaded」，但 preload 运行时文档可能还没建好（documentElement
+// 为 null），SPA 首帧又可能早于 DOMContentLoaded。因此多重兜底：
+// 立即试一次 + 监听 readystatechange + 监听 DOMContentLoaded。
+// 标记必须在 React 首次渲染前就位，否则首帧会按非 darwin 布局渲染。
+//
+// 用 webFrame.executeJavaScript 而非直接写 document：本文件的 tsconfig
+// `lib` 只有 ES2022（不含 dom），且 preload 跑在 isolated world，
+// 用字符串脚本与上面 Notification 桥保持同一姿势。
+if (process.platform === 'darwin') {
+  const MARK_DARWIN = `(() => {
+  const apply = () => {
+    const root = document.documentElement
+    if (root === null) return
+    if (root.dataset.platform === 'darwin') return
+    root.dataset.platform = 'darwin'
+  }
+  apply()
+  document.addEventListener('readystatechange', apply)
+  document.addEventListener('DOMContentLoaded', apply, { once: true })
+})()`
+  void webFrame.executeJavaScript(MARK_DARWIN).catch(() => {
+    // 文档尚未建立时执行会失败；readystatechange / 下一次导航仍会重试。
+  })
+}
+
 // 必须在页面主世界替换 Notification：主进程 executeJavaScript 进不到
 // contextIsolation 下的页面世界，插件会继续走被系统静默丢掉的浏览器 API。
 const WEB_NOTIFICATION_BRIDGE = `(() => {

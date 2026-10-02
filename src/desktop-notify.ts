@@ -1,9 +1,17 @@
 /**
  * 系统通知所有者：主进程用 Electron Notification 弹出，preload 只过 JSON。
  * 不是席位——没有合并/重建，同 contributor+id 替换，窗口销毁或 close 即消失。
+ *
+ * 只有系统横幅一条通路：壳内自绘浮层已删除（它反而让「系统通知没发出」
+ * 看起来像成功了）。
+ *
+ * macOS 上系统通知要求 app 具备有效的 bundle 签名才会注册进
+ * UNUserNotificationCenter。Electron 自带的 linker 签名（identifier=Electron、
+ * Info.plist 未绑定）会被 usernotificationsd 直接拒绝 addRequest，只回一个
+ * UNErrorDomain 1，横幅静默消失。详见 docs/signing-and-notarization.md。
  */
 
-import { Notification, ipcMain, BrowserWindow, screen, type WebContents } from 'electron'
+import { Notification, ipcMain, type BrowserWindow, type WebContents } from 'electron'
 import {
   DESKTOP_ID_RE,
   type DesktopNotifyAction,
@@ -17,6 +25,8 @@ const MAX_TITLE = 80
 const MAX_BODY = 240
 const MAX_ACTIVE_PER_CONTRIBUTOR = 3
 const MIN_NEW_ID_INTERVAL_MS = 10_000
+/** 等系统回执（shown / failed）的上限；超时按已投递处理，不拖住调用方。 */
+const SHOW_CONFIRM_TIMEOUT_MS = 1_500
 
 /** 网页 Notification API 转原生桥的 contributor。不限流：插件测试按钮会连点。 */
 const WEB_NOTIFICATION_CONTRIBUTOR = 'web-notification'
@@ -64,7 +74,6 @@ function drop(row: ActiveNote): void {
   } catch {
     // 系统侧可能已经关掉。
   }
-  closeBanner(bannerKey(row.wcId, row.contributor, row.id))
   const idx = active.indexOf(row)
   if (idx >= 0) active.splice(idx, 1)
 }
@@ -95,101 +104,55 @@ function countContributor(wcId: number, contributor: string): number {
   return active.filter((row) => row.wcId === wcId && row.contributor === contributor).length
 }
 
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
-
-const bannerWindows = new Map<string, BrowserWindow>()
-
-function bannerKey(wcId: number, contributor: string, id: string): string {
-  return `${wcId}:${contributor}:${id}`
-}
-
-function closeBanner(key: string): void {
-  const win = bannerWindows.get(key)
-  if (win === undefined) return
-  bannerWindows.delete(key)
-  if (!win.isDestroyed()) win.close()
-}
-
-/** 壳内横幅：不依赖 macOS 通知授权。系统 Notification 在这台机器上会静默失败。 */
-function showBannerOverlay(wc: WebContents, spec: DesktopNotifySpec): void {
-  const key = bannerKey(wc.id, spec.contributor, spec.id)
-  closeBanner(key)
-
-  const display = screen.getPrimaryDisplay()
-  const width = 380
-  const height = 92
-  const x = display.workArea.x + display.workArea.width - width - 16
-  const y = display.workArea.y + 16
-  const win = new BrowserWindow({
-    width,
-    height,
-    x,
-    y,
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    resizable: false,
-    focusable: true,
-    show: false,
-    type: process.platform === 'darwin' ? 'panel' : 'normal',
-    webPreferences: {
-      sandbox: true,
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  })
-  if (process.platform === 'darwin') win.setAlwaysOnTop(true, 'screen-saver')
-  bannerWindows.set(key, win)
-
-  const title = escapeHtml(spec.title)
-  const body = escapeHtml(spec.body)
-  const html = `<!doctype html><html><head><meta charset="utf-8"><style>
-html,body{margin:0;height:100%;background:transparent;font-family:-apple-system,BlinkMacSystemFont,sans-serif}
-.b{height:100%;box-sizing:border-box;padding:14px 16px;border-radius:12px;background:rgba(28,28,30,.94);color:#f5f5f7;box-shadow:0 8px 28px rgba(0,0,0,.4);display:flex;flex-direction:column;justify-content:center;cursor:pointer;user-select:none}
-.t{font-size:13px;font-weight:600;line-height:1.3}
-.d{font-size:12px;opacity:.85;margin-top:4px;line-height:1.35}
-</style></head><body><div class="b" id="b"><div class="t">${title}</div><div class="d">${body}</div></div>
-<script>document.getElementById('b').addEventListener('click',function(){location.href='dsh-notify://click'})</script></body></html>`
-
-  win.webContents.on('will-navigate', (event, url) => {
-    event.preventDefault()
-    if (url.startsWith('dsh-notify://')) {
-      closeBanner(key)
-      focusMainWindow()
-      const target = webContentsById(wc.id)
-      if (target !== undefined && !target.isDestroyed()) {
-        target.send(Ipc.notify.action, { contributor: spec.contributor, id: spec.id })
-      }
+/**
+ * show() 之后等系统回执。
+ *
+ * Electron 的 `failed` 是异步事件：直接返回 shown:true 会把「系统悄悄丢掉」
+ * 报成成功——未正确签名的包就是这么骗过调用方的（页面拿到 onshow，
+ * 用户却什么都看不到）。等不到任何回执时按已投递处理，不无限拖。
+ */
+function deliver(notification: Notification): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false
+    const finish = (shown: boolean): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(shown)
+    }
+    const timer = setTimeout(() => finish(true), SHOW_CONFIRM_TIMEOUT_MS)
+    notification.once('show', () => finish(true))
+    notification.once('failed', (event, error) => {
+      console.warn('[DSH-Desktop] notification failed', event, error)
+      finish(false)
+    })
+    try {
+      notification.show()
+    } catch (err) {
+      console.warn('[DSH-Desktop] notification.show failed', err)
+      finish(false)
     }
   })
-  win.on('closed', () => {
-    bannerWindows.delete(key)
-  })
-  void win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html))
-  win.once('ready-to-show', () => {
-    if (!win.isDestroyed()) win.showInactive()
-  })
-  setTimeout(() => closeBanner(key), 6000)
 }
 
-/** 给二次启动 `--dsh-test-notify` 用：不经过网页。 */
-export function showTestBanner(): void {
-  showBannerOverlay({ id: 0 } as WebContents, {
-    contributor: WEB_NOTIFICATION_CONTRIBUTOR,
-    id: 'agent-test',
+/** 给二次启动 `--dsh-test-notify` 用：不经过网页，直接打一条系统通知。 */
+export function showTestNotification(): void {
+  if (!Notification.isSupported()) {
+    console.warn('[DSH-Desktop] system notifications not supported')
+    return
+  }
+  const notification = new Notification({
     title: 'DSH-Desktop',
-    body: '测试横幅',
+    body: '系统通知测试',
   })
+  notification.on('show', () => console.log('[DSH-Desktop] test notification shown'))
+  notification.on('failed', (_event, error) => {
+    console.warn('[DSH-Desktop] test notification failed', error)
+  })
+  notification.show()
 }
 
-function showNote(wc: WebContents, spec: DesktopNotifySpec): DesktopNotifyResult {
+async function showNote(wc: WebContents, spec: DesktopNotifySpec): Promise<DesktopNotifyResult> {
   if (!Notification.isSupported()) {
     console.warn('[DSH-Desktop] system notifications not supported')
     return { shown: false }
@@ -250,18 +213,13 @@ function showNote(wc: WebContents, spec: DesktopNotifySpec): DesktopNotifyResult
     const idx = active.indexOf(row)
     if (idx >= 0) active.splice(idx, 1)
   })
-  notification.on('failed', (event) => {
-    console.warn('[DSH-Desktop] notification failed', spec.contributor, spec.id, event)
+
+  const shown = await deliver(notification)
+  if (!shown) {
     const idx = active.indexOf(row)
     if (idx >= 0) active.splice(idx, 1)
-  })
-
-  try {
-    notification.show()
-  } catch (err) {
-    console.warn('[DSH-Desktop] notification.show failed', err)
+    return { shown: false }
   }
-  showBannerOverlay(wc, spec)
 
   console.log(`[DSH-Desktop] notify ${keyOf(spec.contributor, spec.id)}`)
   return { shown: true }
@@ -370,7 +328,7 @@ export function installWebNotificationBridge(win: BrowserWindow): void {
 
 /** 注册通知 IPC。必须在 loadURL 之前调用。 */
 export function setupDesktopNotify(): void {
-  ipcMain.handle(Ipc.notify.show, (event, raw: unknown): DesktopNotifyResult => {
+  ipcMain.handle(Ipc.notify.show, (event, raw: unknown): Promise<DesktopNotifyResult> => {
     const spec = sanitizeShow(raw)
     if (spec === null) {
       console.warn('[DSH-Desktop] rejected notify spec', raw)

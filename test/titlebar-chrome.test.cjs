@@ -1,13 +1,17 @@
 // 标题栏 chrome 的规则回归测试。
 //
-// 这些断言不是「CSS 长这样」的快照，而是四条一旦丢失就会让真实环境复现
-// bug 的不变量：面板穿透、红绿灯遮挡、拖动带丢失、幂等注入。
+// 接入 `<html data-platform="darwin">` 之后，上游 DSH 接管了绝大部分窗口
+// 集成（全宽拖拽带、侧栏顶部条、全屏面板 strip 的 drag/no-drag、88px 内缩、
+// 面板与浮层的 no-drag）。本文件因此**只断言本壳仍需自己负责的两条**，
+// 并显式断言「我们不再重复上游职责」——包括那条最容易误加的
+// 「面板 no-drag」，它会掐掉上游的拖拽带。
 
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const { FULLSCREEN_STRIP_INSET_PX, titleBarChromeCSS } = require('../dist/titlebar-chrome.js')
 
 const mac = titleBarChromeCSS('darwin')
+const macFullscreen = titleBarChromeCSS('darwin', true)
 const win = titleBarChromeCSS('win32')
 
 /** 抽出某条规则体，忽略空白差异。 */
@@ -17,76 +21,118 @@ function body(css, selector) {
   return css.slice(index + selector.length, css.indexOf('}', index))
 }
 
-test('面板整块 no-drag，切断下层热区穿透', () => {
-  // Electron 只把显式声明 app-region 的元素算进拖动区域；全屏面板
-  // （position:fixed; inset:0）不自己声明 no-drag，侧栏与中间列的顶部
-  // 40px 通条就会穿透上来，标签页点不动。
-  const rule = body(mac, '[data-sidebar-right-panel],')
-  assert.match(rule, /-webkit-app-region:\s*no-drag/)
-  assert.match(mac, /\[data-dockkit-float\],/)
-  assert.match(mac, /\[data-sidebar-right-float-host\]/)
-})
-
-test('全屏面板的 tab strip 声明为 drag，窗口仍可拖动', () => {
-  // 全屏后 centerCol 的顶部通条被面板盖住，AppFrame 的左右 handle 又在
-  // 屏幕两侧，strip 是窗口顶部唯一还能拖的横条。
-  const rule = body(mac, "[data-sidebar-right-panel='fullscreen'] [data-dockkit-strip] ")
-  assert.match(rule, /-webkit-app-region:\s*drag/)
-})
-
-test('strip 上的交互控件全部 no-drag', () => {
-  // chip（role=tab / data-dockkit-tab）、关闭按钮、addTab、两个面板控制
-  // 按钮、分屏分隔条：任意一个漏掉，那一片按下去就变成拖窗口。
-  const strip = "[data-sidebar-right-panel='fullscreen'] [data-dockkit-strip]"
-  for (const target of [
-    '[data-dockkit-tab]',
-    'button',
-    "[role='tab']",
-    "[role='button']",
-    'input',
-  ]) {
+test('侧栏 logo 行的交互控件 no-drag', () => {
+  // 上游只声明 `.logoRow { drag }`；`app-region` 不继承，若不给其中的
+  // `<button>` 挖回来，点收起按钮会变成拖窗口。上游的全局 `[role=button]`
+  // 覆盖不到裸 `<button>`。
+  for (const target of ['button', 'a', "[role='button']"]) {
     assert.ok(
-      mac.includes(`${strip} ${target}`),
-      `全屏 strip 下缺少 no-drag 目标：${target}`,
+      mac.includes(`[class*='logoRow'] ${target}`),
+      `logoRow 下缺少 no-drag 目标：${target}`,
     )
   }
-  assert.ok(mac.includes(`[data-sidebar-right-panel='fullscreen'] [data-dockkit-divider]`))
+  assert.match(body(mac, "[class*='logoRow'] button"), /-webkit-app-region:\s*no-drag/)
 })
 
-test('macOS 只给贴窗口左边缘的那条 strip 内缩，避让红绿灯', () => {
-  // 每个 pane 的 strip 都是【它自己 pane 的直接子元素】，所以
-  // `[data-dockkit-pane] > [data-dockkit-strip]` 并不是「最左侧那个 pane」，
-  // 它匹配所有 pane —— 曾经因此让分屏后的右 pane 也白吃 80px 内缩。
-  // 必须把 pane 的【父级】也限定住：只有 pane 自己坐在 surface 里（未分屏）
-  // 或 cell:first-child 里（分屏后的左 pane），它的左边缘才等于窗口左边缘。
-  const inset = body(mac, '[data-sidebar-right-panel=\'fullscreen\'] :is(')
-  assert.match(inset, /\[data-dockkit-surface\]/)
-  assert.match(inset, /\[data-dockkit-cell\]:first-child/)
-  assert.match(inset, />\s*\[data-dockkit-pane\]\s*>\s*\[data-dockkit-strip\]/)
-  assert.match(inset, new RegExp(`padding-left:\\s*${FULLSCREEN_STRIP_INSET_PX}px`))
-
-  // 任何【未限定 pane 父级】的内缩选择器都会命中右 pane：同一份样式里
-  // 不允许出现这种写法。比对时先去掉已限定的那条。
-  const withoutFixed = mac.replace(inset, '')
-  assert.doesNotMatch(withoutFixed, /\[data-dockkit-pane\]\s*>\s*\[data-dockkit-strip\]\s*[,{]/)
-
-  assert.equal(mac.split('padding-left').length - 1, 1, '内缩只应出现在一条规则里')
-})
-
-test('Windows 保留基础热区，但不为红绿灯做面板内缩', () => {
-  // Windows 有原生标题栏，Electron 会整份忽略渲染进程上报的拖动区域
-  // （owner_window()->has_frame() 时直接 return），所以这里的规则既不生效
-  // 也不有害；真正要不成立的是「为红绿灯让位」那条。
-  assert.equal(win.includes('padding-left'), false)
-  assert.equal(win.includes('margin-top: 20px'), false)
-})
-
-test('基础的侧栏与会话顶栏热区保留', () => {
-  for (const css of [mac, win]) {
-    assert.match(css, /\[class\*='logoRow'\] \{ -webkit-app-region: drag;/)
-    assert.match(css, /header\[class\*='header'\]:not\(\[class\*='headerHidden'\]\)/)
-    assert.match(css, /\[class\*='centerCol'\]::before/)
+test('会话顶栏整行可拖，控件 no-drag', () => {
+  // 上游没提供这条：`ui-conversation` 只给了 header 内部四个区域的 no-drag，
+  // 从未把 header 本身声明为 drag；而 `.leadingBand` 只覆盖顶部 52px，
+  // 带视图 tab 条的 header 约 76px，下半部分不在 band 内。
+  assert.match(
+    body(mac, "header[class*='header']:not([class*='headerHidden']) "),
+    /-webkit-app-region:\s*drag/,
+  )
+  for (const target of ['button', 'a', "[role='button']", "[role='tab']", 'input', 'select']) {
+    assert.ok(
+      mac.includes(`header[class*='header'] ${target}`),
+      `会话顶栏下缺少 no-drag 目标：${target}`,
+    )
   }
-  assert.match(mac, /margin-top:\s*20px !important/)
-  assert.equal(win.includes('margin-top: 20px'), false)
+})
+
+test('不给右侧面板整块加 no-drag', () => {
+  // 全屏面板铺满窗口。上游对面板内部的 strip / chip / 分隔条已有 darwin
+  // 门控的 no-drag 覆盖，本壳无需重复，也**不应**给整个面板加 no-drag：
+  // 面板内大部分区域本就该可拖（它是标题栏的延伸），整块减区会掐掉
+  // 那块拖拽面积。
+  assert.doesNotMatch(mac, /\[data-sidebar-right-panel[^\]]*\]\s*[,{][^}]*app-region:\s*no-drag/)
+  assert.doesNotMatch(mac, /\[data-sidebar-right-panel\]/)
+})
+
+test('顶部有可命中的全宽热区（0.2.1 拖不动窗口的回归）', () => {
+  // 0.2.1 曾删掉本壳自写的顶部通条，改依赖上游 `.leadingBand`，结果
+  // 窗口在任何位置都拖不动。该 band 是 `pointer-events: none`，
+  // elementFromPoint 实测穿透到下层，自身不被命中，因此不产生可用热区。
+  // 本壳必须自备一条 pointer-events:auto 的全宽 drag 带。
+  const band = body(mac, "html[data-platform='darwin'] #root::before ")
+  assert.match(band, /-webkit-app-region:\s*drag/)
+  assert.match(band, /pointer-events:\s*auto/)
+  assert.match(band, /position:\s*fixed/)
+  assert.match(band, /height:\s*52px/)
+  // 不能遮挡内容：必须压在下层
+  assert.match(band, /z-index:\s*-1/)
+})
+
+test('中和上游 body > :not(#root) 的整窗减区（拖不动的真正根因）', () => {
+  // 打上 data-platform=darwin 后，上游这条兜底规则会命中两个**铺满整窗**
+  // 的插件浮层（.PCRLGG_*_layer / .dsh-status-rotator-danmaku-layer），
+  // 它们绘制在 #root 之后，按「后绘制者胜出」把整窗从拖拽区减掉。
+  // 实测：带标记时两者 = no-drag；移除标记 = none。
+  // 本壳用 revert 还原为初值（不产生矩形），无需 !important。
+  const neuter = body(mac, "html[data-platform='darwin'] body > :not(#root) ")
+  assert.match(neuter, /-webkit-app-region:\s*revert/)
+  assert.match(neuter, /app-region:\s*revert/)
+  // 不能用 none/auto —— 都不是 -webkit-app-region 的合法关键字，
+  // 声明会被丢弃（曾据此写出无效修复）。
+  assert.doesNotMatch(neuter, /(none|auto)\s*;/)
+})
+
+test('不重复上游已承担的全屏面板与内缩规则', () => {
+  // 这些上游都已提供，且全在 darwin 门控下：
+  //   ._stripTabs / ._stripChrome / ._paneBody / ._float / ._divider → no-drag
+  //   --dsh-dockkit-strip-inline-start: 88px → 首列让位红绿灯
+  // 本壳重复声明只会制造两套真相。
+  assert.doesNotMatch(mac, /--dsh-dockkit-strip-inline-start/)
+  assert.doesNotMatch(mac, /\[data-dockkit-strip\]\s*\{[^}]*drag/)
+  assert.doesNotMatch(mac, /\[data-dockkit-divider\]/)
+  assert.doesNotMatch(mac, /\[data-dockkit-float\]/)
+})
+
+test('不再手写侧栏让位 hack（上游 .topStrip 接管）', () => {
+  // 上游在 darwin 下渲染 52px `.topStrip`，logoRow 随之落在 y=40。
+  // 本壳历史上用 `margin-top: 20px !important` 顶替，实测会把 logoRow
+  // 推到 y=26 —— 仍在红绿灯竖直带（y 20~32）内，既不准又会与上游叠加。
+  assert.doesNotMatch(mac, /margin-top:/)
+  assert.doesNotMatch(mac, /:has\(> \[class\*='logoRow'\]\)/)
+  assert.doesNotMatch(mac, /centerCol/)
+})
+
+test('所有拖拽声明同时带 -webkit- 前缀与标准属性', () => {
+  for (const css of [mac, macFullscreen, win]) {
+    const regions = [...css.matchAll(/-webkit-app-region:\s*(no-drag|drag);/g)]
+    assert.ok(regions.length > 0)
+    for (const region of regions) {
+      const following = css.slice(region.index + region[0].length)
+      assert.match(following, new RegExp(`^\\s*app-region:\\s*${region[1]};`))
+    }
+  }
+})
+
+test('原生全屏不影响本壳输出（上游用 data-fullscreen 自行处理）', () => {
+  // 上游在 [data-fullscreen] 下把内缩改回 10px、leading-clearance 取 84px。
+  // 该标记由 controller 维护，本函数不再按全屏分支。
+  assert.equal(mac, macFullscreen)
+  for (const platform of ['darwin', 'win32', 'linux']) {
+    assert.equal(titleBarChromeCSS(platform, true), titleBarChromeCSS(platform, false))
+  }
+})
+
+test('Windows 输出同样是上游未覆盖的那两条', () => {
+  assert.equal(win, mac)
+})
+
+test('导出的红绿灯留白常量与上游取值一致', () => {
+  // 上游 `ui-sidebar-right` 用 88px；本常量保留作为可对照的单一来源，
+  // 若上游改值，这里会先暴露出来。
+  assert.equal(FULLSCREEN_STRIP_INSET_PX, 88)
 })

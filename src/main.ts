@@ -15,7 +15,7 @@
 import { type ChildProcess } from 'node:child_process'
 import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { app, BrowserWindow, dialog, session, shell } from 'electron'
+import { app, BrowserWindow, dialog, session, shell, systemPreferences } from 'electron'
 import { DSH_HOST, READY_TIMEOUT_MS, findFreePort, startDsh, stopDsh, waitForPortFree, waitForReady, type DshHost } from './dsh-host'
 import { registerDshWebHost, restartDshWeb } from './dsh-lifecycle'
 import {
@@ -28,15 +28,20 @@ import {
 import { ensureDshInstalled, installedDshBin } from './runtime-manager'
 import { openRecoveryWindow, recordBootFailure, setupPluginRecovery } from './plugin-recovery'
 import { checkDesktopUpdates, setupDesktopBridge } from './desktop-bridge'
-import { installWebNotificationBridge, setupDesktopNotify, showTestBanner } from './desktop-notify'
+import {
+  installWebNotificationBridge,
+  setupDesktopNotify,
+  showTestNotification,
+} from './desktop-notify'
 import { closeAllOverlays, setupDesktopOverlays } from './desktop-overlays'
 import { refreshDesktopSeats, setupDesktopSeats } from './desktop-seats'
 import { installDesktopPlugin } from './plugin-installer'
 import { enforceRegularDockPolicy, startDockPolicyGuard, stopDockPolicyGuard } from './dock-policy'
 import { focusMainWindow, focusWindow, setWindowRole } from './windows'
-import { titleBarChromeCSS } from './titlebar-chrome'
+import { installTitleBarChrome } from './titlebar-chrome-controller'
 import { readWebPort, rememberWebPort } from './web-port'
 import { dshAuthCookieUrl, isDshAuthCookie } from './dsh-auth-cookies'
+import { installDshMicrophonePermission } from './desktop-microphone'
 
 /**
  * 开发版可以和已安装版同时运行，但两者不能共享 Chromium 数据目录：
@@ -57,7 +62,7 @@ if (!isPrimaryInstance) {
   app.on('second-instance', (_event, argv) => {
     // 二次启动会在 Dock 里闪一下再因单实例锁退出；顺带把旧实例瓷砖拉回。
     enforceRegularDockPolicy()
-    if (argv.includes('--dsh-test-notify')) showTestBanner()
+    if (argv.includes('--dsh-test-notify')) showTestNotification()
     focusMainWindow()
   })
 }
@@ -69,14 +74,6 @@ let dshProcess: ChildProcess | null = null
 let dshBin: string | undefined
 let dshPort: number | null = null
 let mainWindow: BrowserWindow | null = null
-/**
- * 当前注入的标题栏 chrome 样式 key。
- *
- * `did-finish-load` 每次导航都会重跑，而旧 `<style>` 不随导航丢弃：
- * 不先移除就会在热重启/刷新后把同一套规则叠上一层又一层（每层都带
- * `!important`，面板的内缩 padding 会越叠越宽）。
- */
-const titleBarChromeKeys: string[] = []
 let dshOrigin: string | null = null
 /** 打开窗口用的 URL：新运行时带启动 token，旧运行时等于 origin。 */
 let dshLaunchUrl: string | null = null
@@ -125,6 +122,13 @@ function createWindow(url: string, splash: BrowserWindow): BrowserWindow {
   })
 
   setWindowRole(win, 'main')
+  installDshMicrophonePermission(
+    win.webContents.session,
+    win.webContents,
+    () => dshOrigin,
+    process.platform,
+    () => systemPreferences.askForMediaAccess('microphone'),
+  )
   win.setMenuBarVisibility(false)
   win.once('ready-to-show', () => {
     refreshDesktopSeats()
@@ -143,9 +147,9 @@ function createWindow(url: string, splash: BrowserWindow): BrowserWindow {
     closeAllOverlays()
     if (!stopping) app.quit()
   })
-  // DSH 网页加载完成后注入顶部拖拽条与红绿灯避让样式（隐藏原生标题栏后必需）。
+  // 网页加载与原生全屏切换时同步拖拽条和红绿灯避让样式。
+  installTitleBarChrome(win, process.platform)
   win.webContents.on('did-finish-load', () => {
-    void applyTitleBarChrome(win)
     enforceRegularDockPolicy()
   })
   // AI 输出的超链接不在壳内开新窗口、也不把应用窗口整页跳走：
@@ -175,35 +179,6 @@ function createWindow(url: string, splash: BrowserWindow): BrowserWindow {
   installWebNotificationBridge(win)
   void win.loadURL(url)
   return win
-}
-
-/**
- * 把标题栏 chrome（窗口拖动热区 + 浮层穿透切断）注入 DSH 网页。
- *
- * 规则本体在 `titlebar-chrome.ts` 的纯函数里，便于单测；这里只做注入。
- * 注入必须幂等：`did-finish-load` 会在每次 reload / 热重启后重跑，而旧的
- * `<style>` 不会随导航清掉，重复 insertCSS 会让规则无限堆积。
- */
-async function applyTitleBarChrome(win: BrowserWindow): Promise<void> {
-  const wc = win.webContents
-  if (wc.isDestroyed()) return
-
-  for (const key of titleBarChromeKeys) {
-    if (wc.isDestroyed()) return
-    try {
-      await wc.removeInsertedCSS(key)
-    } catch {
-      // 上一轮注入的 key 在导航后已失效；没有可移除的样式，继续。
-    }
-  }
-  titleBarChromeKeys.length = 0
-
-  if (wc.isDestroyed()) return
-  try {
-    titleBarChromeKeys.push(await wc.insertCSS(titleBarChromeCSS(process.platform)))
-  } catch {
-    // 注入失败不阻断启动：窗口只是拖不动，页面功能不受影响。
-  }
 }
 
 /** 启动/安装期间的 splash 窗口：本地静态页，进度条由 CSS 动画驱动，文字靠主进程更新。 */
@@ -259,17 +234,26 @@ async function waitExitOrReady(
   host: DshHost,
   port: number,
 ): Promise<{ kind: 'ready'; url: string } | { kind: 'exited' | 'timeout' }> {
+  const hasExited = (): boolean => host.child.exitCode !== null || host.child.signalCode !== null
+  if (hasExited()) return { kind: 'exited' }
   const controller = new AbortController()
-  const exited = new Promise<{ kind: 'exited' }>((resolveExit) =>
-    host.child.once('exit', () => resolveExit({ kind: 'exited' })),
-  )
+  let onExit!: () => void
+  const exited = new Promise<{ kind: 'exited' }>((resolveExit) => {
+    onExit = () => resolveExit({ kind: 'exited' })
+    host.child.once('exit', onExit)
+    if (hasExited()) onExit()
+  })
   const ready = waitForReady(host, port, READY_TIMEOUT_MS, controller.signal).then(
     (url) => ({ kind: 'ready' as const, url }),
     () => ({ kind: 'timeout' as const }),
   )
-  const result = await Promise.race([exited, ready])
-  controller.abort()
-  return result
+  try {
+    const result = await Promise.race([exited, ready])
+    return hasExited() ? { kind: 'exited' } : result
+  } finally {
+    controller.abort()
+    host.child.off('exit', onExit)
+  }
 }
 
 function attachExitHandler(host: DshHost): void {

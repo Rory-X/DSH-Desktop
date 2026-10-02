@@ -55,6 +55,8 @@ desktop.updates.relaunch()                           // 重启整个桌面应用
   询问，由插件用 DSH Modal 渲染「稍后 / 立即重启服务」——不是系统原生 dialog，
   也不强制。用户点「稍后」后同一份变更不再烦，再改才再问。
 
+提示的 `ackPrompt` / `respondPrompt` 只接受收到该提示的主窗口主框架。窗口销毁、主框架换文档或 renderer 结束时，旧提示作废并清理计时器；稍后到达的旧 ID 不会重启服务。详见 [生命周期修复验收](/Users/jiahaoqian/proj/DSH-Desktop/docs/lifecycle-reliability-2026-09-30.md)。
+
 ### 兼容层（0.1.x 旧插件）
 
 npm 上暂无 `dsh-desktop-update@0.2.0`，已装的插件还是 0.1.x，只认壳侧的这批端点。
@@ -142,9 +144,15 @@ await desktop.notify.close('desktop-update') // 该 contributor 全部
 - 标题最长 80，正文最长 240
 - 插件卸载时应 `close(contributor)`
 
-macOS 打包包在 `Info.plist` 里声明了 `NSUserNotificationAlertStyle=alert`。开发态 `pnpm start` 走 Electron 二进制，通知可能显示为 Electron，系统也可能先问权限。
+**只有系统横幅一条通路**（macOS 通知中心里的真通知）。壳内自绘浮层已删除——它会在系统通知实际没发出时仍然显示，把失败伪装成成功。
+
+`shown: true` 现在等系统回执：`notification` 的 `show` 事件到达才算成功，`failed` 事件（例如签名无效）返回 `{ shown: false }`。1.5 秒内既无 `show` 也无 `failed` 时按已投递处理。
+
+macOS 打包包在 `Info.plist` 里声明了 `NSUserNotificationAlertStyle=alert`。开发态 `pnpm start` 走 Electron 二进制，系统可能先问权限。
 
 网页里的 `new Notification()`（例如 `dsh-notification` 插件）由主窗口 preload 接到本族原生通知。Chromium 自己的 Notification API 在桌面壳里会显示已授权、却不向系统申请 UNUserNotificationCenter，横幅被静默丢掉。
+
+系统横幅能弹出来**要求 app 有有效 bundle 签名**：只带 Electron 自带 linker 签名（identifier=`Electron`、Info.plist 未绑定）的包会被 `usernotificationsd` 拒绝 `addRequest`，只回一个 `UNErrorDomain 1`。打包配置见 `docs/signing-and-notarization.md`。
 
 ## `overlays`
 

@@ -8,7 +8,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { app, ipcMain } from 'electron'
+import { app, ipcMain, type IpcMainEvent, type Event as ElectronEvent, type WebContentsDidStartNavigationEventParams } from 'electron'
 import type { DesktopRestartChoice, DesktopRestartPrompt } from './api'
 import { Ipc } from './ipc'
 import { focusMainWindow, getMainWindow } from './windows'
@@ -79,6 +79,8 @@ const RESPOND_TIMEOUT_MS = 120_000
 interface PendingPrompt {
   id: string
   acked: boolean
+  webContentsId: number
+  dispose: () => void
   resolve: (choice: DesktopRestartChoice | 'dropped') => void
 }
 
@@ -88,21 +90,28 @@ let offerChain: Promise<unknown> = Promise.resolve()
 
 function settlePending(id: string, choice: DesktopRestartChoice | 'dropped'): void {
   if (pending === null || pending.id !== id) return
-  const { resolve } = pending
+  const { resolve, dispose } = pending
   pending = null
+  dispose()
   resolve(choice)
+}
+
+function isPendingSender(event: IpcMainEvent, id: unknown): id is string {
+  return typeof id === 'string' && pending !== null && pending.id === id
+    && pending.webContentsId === event.sender.id && !event.sender.isDestroyed()
+    && event.senderFrame !== null && event.senderFrame === event.sender.mainFrame
 }
 
 /** 注册询问 IPC。setupDesktopBridge 时调一次。 */
 export function setupRestartPromptIpc(): void {
   if (ipcReady) return
   ipcReady = true
-  ipcMain.on(Ipc.updates.promptAck, (_event, id: unknown) => {
-    if (typeof id !== 'string' || pending === null || pending.id !== id) return
+  ipcMain.on(Ipc.updates.promptAck, (event, id: unknown) => {
+    if (!isPendingSender(event, id) || pending === null) return
     pending.acked = true
   })
-  ipcMain.on(Ipc.updates.promptResponse, (_event, id: unknown, choice: unknown) => {
-    if (typeof id !== 'string') return
+  ipcMain.on(Ipc.updates.promptResponse, (event, id: unknown, choice: unknown) => {
+    if (!isPendingSender(event, id)) return
     if (choice !== 'later' && choice !== 'restart') return
     settlePending(id, choice)
   })
@@ -113,6 +122,7 @@ function sendPrompt(prompt: DesktopRestartPrompt): boolean {
   if (win === undefined || win.isDestroyed() || win.webContents.isDestroyed()) return false
   try {
     focusMainWindow()
+    if (pending === null || pending.id !== prompt.id || pending.webContentsId !== win.webContents.id) return false
     win.webContents.send(Ipc.updates.prompt, prompt)
     return true
   } catch {
@@ -121,6 +131,9 @@ function sendPrompt(prompt: DesktopRestartPrompt): boolean {
 }
 
 async function askRenderer(reason: RestartWebReason): Promise<DesktopRestartChoice | 'dropped'> {
+  const win = getMainWindow()
+  if (win === undefined || win.isDestroyed() || win.webContents.isDestroyed()) return 'dropped'
+  const contents = win.webContents
   const zh = isZh()
   const copy = COPY[reason][zh ? 'zh' : 'en']
   const prompt: DesktopRestartPrompt = {
@@ -134,7 +147,23 @@ async function askRenderer(reason: RestartWebReason): Promise<DesktopRestartChoi
   }
 
   return new Promise((resolve) => {
-    pending = { id: prompt.id, acked: false, resolve }
+    let retryTimer: NodeJS.Timeout | undefined
+    let responseTimer: NodeJS.Timeout | undefined
+    const dropped = (): void => settlePending(prompt.id, 'dropped')
+    const navigation = (details: ElectronEvent<WebContentsDidStartNavigationEventParams>): void => {
+      if (details.isMainFrame && !details.isSameDocument) dropped()
+    }
+    const dispose = (): void => {
+      clearTimeout(retryTimer)
+      clearTimeout(responseTimer)
+      contents.off('destroyed', dropped)
+      contents.off('render-process-gone', dropped)
+      contents.off('did-start-navigation', navigation)
+    }
+    pending = { id: prompt.id, acked: false, webContentsId: contents.id, resolve, dispose }
+    contents.once('destroyed', dropped)
+    contents.on('render-process-gone', dropped)
+    contents.on('did-start-navigation', navigation)
     let tries = 0
     const tick = (): void => {
       if (pending === null || pending.id !== prompt.id) return
@@ -147,15 +176,17 @@ async function askRenderer(reason: RestartWebReason): Promise<DesktopRestartChoi
       }
       if (!sendPrompt(prompt)) {
         if (tries >= ACK_TRIES) settlePending(prompt.id, 'dropped')
-        else setTimeout(tick, ACK_RETRY_MS).unref?.()
+        else { retryTimer = setTimeout(tick, ACK_RETRY_MS); retryTimer.unref?.() }
         return
       }
-      setTimeout(tick, ACK_RETRY_MS).unref?.()
+      retryTimer = setTimeout(tick, ACK_RETRY_MS)
+      retryTimer.unref?.()
     }
-    tick()
-    setTimeout(() => {
+    responseTimer = setTimeout(() => {
       settlePending(prompt.id, 'dropped')
-    }, RESPOND_TIMEOUT_MS).unref?.()
+    }, RESPOND_TIMEOUT_MS)
+    responseTimer.unref?.()
+    tick()
   })
 }
 

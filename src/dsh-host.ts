@@ -129,7 +129,7 @@ export async function waitForReady(
 /** 等子进程退出，最多等 timeoutMs；已退出则立刻返回。 */
 export function onceExit(child: ChildProcess, timeoutMs: number): Promise<void> {
   return new Promise((resolveExit) => {
-    if (child.exitCode !== null) {
+    if (child.exitCode !== null || child.signalCode !== null) {
       resolveExit()
       return
     }
@@ -139,7 +139,7 @@ export function onceExit(child: ChildProcess, timeoutMs: number): Promise<void> 
       resolveExit()
     }
     child.once('exit', onExit)
-    if (child.exitCode !== null) {
+    if (child.exitCode !== null || child.signalCode !== null) {
       child.off('exit', onExit)
       clearTimeout(timer)
       resolveExit()
@@ -149,14 +149,14 @@ export function onceExit(child: ChildProcess, timeoutMs: number): Promise<void> 
 
 /** SIGTERM 后等待，仍在则 SIGKILL。进程已不在时当作成功。 */
 export async function stopDsh(child: ChildProcess, timeoutMs = 3000): Promise<void> {
-  if (child.exitCode !== null) return
+  if (child.exitCode !== null || child.signalCode !== null) return
   try {
     child.kill('SIGTERM')
   } catch {
     return
   }
   await onceExit(child, timeoutMs)
-  if (child.exitCode === null) {
+  if (child.exitCode === null && child.signalCode === null) {
     try {
       child.kill('SIGKILL')
     } catch {

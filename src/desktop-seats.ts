@@ -26,6 +26,7 @@ import {
 } from './api'
 import { restartDshWeb } from './dsh-lifecycle'
 import { Ipc } from './ipc'
+import { nativeMenuItemId, scheduleTrailing, upsertContribution } from './desktop-seat-state'
 import { focusMainWindow, webContentsById } from './windows'
 
 export type {
@@ -53,6 +54,8 @@ const DECLARED_SEATS: readonly DesktopSeatInfo[] = [
 const MAX_ITEMS = 24
 const MAX_DEPTH = 2
 const MAX_LABEL = 120
+/** Wait for one client contribution burst to settle before replacing native menus. */
+const REBUILD_DEBOUNCE_MS = 100
 const ID_RE = DESKTOP_ID_RE
 const ACCEL_RE =
   /^(?:(?:CommandOrControl|CmdOrCtrl|Command|Cmd|Control|Ctrl|Alt|Option|AltGr|Shift|Super|Meta)\+)*(?:[A-Za-z0-9]+|F(?:[1-9]|1[0-9]|2[0-4])|Plus|Space|Tab|Backspace|Delete|Return|Enter|Up|Down|Left|Right)$/
@@ -131,16 +134,6 @@ function sanitizeContribution(raw: unknown): Omit<StoredContribution, 'wcId'> | 
   return { seat: obj.seat, contributor: obj.contributor, menu, order, items, tooltip }
 }
 
-function sameContribution(a: StoredContribution, b: Pick<StoredContribution, 'wcId' | 'seat' | 'contributor' | 'menu'>): boolean {
-  return a.wcId === b.wcId && a.seat === b.seat && a.contributor === b.contributor && a.menu === b.menu
-}
-
-function upsert(row: StoredContribution): void {
-  const idx = contributions.findIndex((c) => sameContribution(c, row))
-  if (idx >= 0) contributions[idx] = row
-  else contributions.push(row)
-}
-
 function remove(wcId: number, seat: DesktopSeatName, contributor: string): void {
   for (let i = contributions.length - 1; i >= 0; i--) {
     const row = contributions[i]
@@ -167,20 +160,25 @@ function sorted(seat: DesktopSeatName, menu?: DesktopMenuAttach): StoredContribu
 function toElectronItems(
   row: StoredContribution,
   items: DesktopMenuItemSpec[],
+  options: { accelerators?: boolean } = {},
 ): MenuItemConstructorOptions[] {
   return items.map((item) => {
     if (item.type === 'separator') return { type: 'separator' }
     const opts: MenuItemConstructorOptions = {
-      id: `${row.contributor}:${item.id ?? ''}`,
+      // One contribution can appear in several native NSMenu trees. Keep each
+      // native item identity unique to its owning surface.
+      id: nativeMenuItemId(row, item.id ?? ''),
       type: item.type ?? 'normal',
       label: item.label,
       enabled: item.enabled ?? true,
       visible: item.visible ?? true,
       checked: item.checked,
-      accelerator: item.accelerator,
+      // Tray is alternate access to commands already present in the app menu;
+      // it must not register the same application accelerator a second time.
+      accelerator: options.accelerators === false ? undefined : item.accelerator,
     }
     if (item.submenu !== undefined && item.submenu.length > 0) {
-      opts.submenu = toElectronItems(row, item.submenu)
+      opts.submenu = toElectronItems(row, item.submenu, options)
     } else if (item.id !== undefined) {
       const { seat, contributor } = row
       const actionId = item.id
@@ -195,12 +193,15 @@ function toElectronItems(
   })
 }
 
-function groupedPluginItems(rows: StoredContribution[]): MenuItemConstructorOptions[] {
+function groupedPluginItems(
+  rows: StoredContribution[],
+  options?: { accelerators?: boolean },
+): MenuItemConstructorOptions[] {
   const out: MenuItemConstructorOptions[] = []
   for (const row of rows) {
     if (row.items.length === 0) continue
     if (out.length > 0) out.push({ type: 'separator' })
-    out.push(...toElectronItems(row, row.items))
+    out.push(...toElectronItems(row, row.items, options))
   }
   return out
 }
@@ -282,7 +283,7 @@ function ownerAppMenu(pluginItems: MenuItemConstructorOptions[]): MenuItemConstr
 
 function rebuildTray(): void {
   const rows = sorted('tray')
-  const pluginItems = groupedPluginItems(rows)
+  const pluginItems = groupedPluginItems(rows, { accelerators: false })
   if (pluginItems.length === 0) {
     if (tray !== null) {
       tray.destroy()
@@ -313,12 +314,23 @@ function rebuildTray(): void {
 }
 
 function scheduleRebuild(): void {
-  if (rebuildTimer !== null) return
-  rebuildTimer = setTimeout(() => {
-    rebuildTimer = null
-    rebuildApplicationMenu()
-    rebuildTray()
-  }, 16)
+  // Contributions arrive as several sequential IPC calls. Reset the timer on
+  // each call so macOS sees one native NSMenu replacement after the burst,
+  // instead of repeatedly destroying live menus between individual seats.
+  rebuildTimer = scheduleTrailing(
+    rebuildTimer,
+    () => {
+      rebuildTimer = null
+      rebuildApplicationMenu()
+      rebuildTray()
+    },
+    REBUILD_DEBOUNCE_MS,
+    {
+      set: (task, delayMs) => setTimeout(task, delayMs),
+      clear: (timer) => clearTimeout(timer),
+      unref: (timer) => timer.unref?.(),
+    },
+  )
 }
 
 /** 窗口创建后 Electron 可能冲掉应用菜单；主窗口 ready-to-show 时再刷一次。 */
@@ -344,12 +356,14 @@ export function setupDesktopSeats(): void {
       throw new Error('invalid desktop contribution')
     }
     const wc = event.sender
-    upsert({ wcId: wc.id, ...spec })
+    const changed = upsertContribution(contributions, { wcId: wc.id, ...spec })
     watchSender(wc)
-    console.log(
-      `[DSH-Desktop] seat ${spec.seat}/${spec.menu} from ${spec.contributor} (${spec.items.length} items)`,
-    )
-    scheduleRebuild()
+    if (changed) {
+      console.log(
+        `[DSH-Desktop] seat ${spec.seat}/${spec.menu} from ${spec.contributor} (${spec.items.length} items)`,
+      )
+      scheduleRebuild()
+    }
   })
 
   ipcMain.handle(Ipc.seats.revoke, (event, seat: unknown, contributor: unknown) => {
