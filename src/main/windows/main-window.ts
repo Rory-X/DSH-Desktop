@@ -1,7 +1,8 @@
 /** 主窗口的原生外观、导航规则和页面集成；应用编排通过回调接入。 */
-import { app, BrowserWindow, screen, shell } from 'electron'
+import { app, BrowserWindow, screen, shell, systemPreferences } from 'electron'
 import { join } from 'node:path'
 import { enforceRegularDockPolicy } from '../platform/dock-policy'
+import { installDshMicrophonePermission } from '../platform/microphone'
 import { preloadPath } from '../platform/paths'
 import { watchPluginFailures } from '../plugins/recovery'
 import { setWindowRole } from './registry'
@@ -81,6 +82,13 @@ export function createMainWindow(url: string, options: MainWindowOptions): Brows
   })
 
   setWindowRole(win, 'main')
+  installDshMicrophonePermission(
+    win.webContents.session,
+    win.webContents,
+    () => options.getOrigin(),
+    process.platform,
+    () => systemPreferences.askForMediaAccess('microphone'),
+  )
   installTitleBarChrome(win, process.platform)
   win.setMenuBarVisibility(false)
   // Electron 恢复已保存的尺寸、位置和显示状态；首次启动采用上面的默认 bounds。
