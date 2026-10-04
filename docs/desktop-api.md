@@ -13,12 +13,12 @@ if (desktop === undefined) return // 非桌面壳，空操作
 
 四族并列，不要把动作摊到根上，也不要把通知或 overlay 做成席位。其中 `updates` 只做执行——检测在壳里。
 
-| 族 | 语义 | 寿命 |
-|---|---|---|
-| `updates` | 更新执行（检测在壳里） | 一次请求 |
-| `seats` | 持久原生 UI 贡献（菜单 / 托盘） | 跟插件 fiber 同寿 |
-| `notify` | 系统通知 | 弹出 / 替换 / 关掉 |
-| `overlays` | 同源原生小窗（透明置顶等） | 跟贡献窗口同寿 |
+| 族         | 语义                            | 寿命               |
+| ---------- | ------------------------------- | ------------------ |
+| `updates`  | 更新执行（检测在壳里）          | 一次请求           |
+| `seats`    | 持久原生 UI 贡献（菜单 / 托盘） | 跟插件 fiber 同寿  |
+| `notify`   | 系统通知                        | 弹出 / 替换 / 关掉 |
+| `overlays` | 同源原生小窗（透明置顶等）      | 跟贡献窗口同寿     |
 
 主进程不跑 Cordis，也不把 `Menu` / `Tray` / `Notification` / `BrowserWindow` 对象交给网页。点击只回传 `{ contributor, id }`。
 
@@ -41,14 +41,16 @@ if (desktop === undefined) return // 非桌面壳，空操作
 网页这一族只剩执行——因为下面每件事都必须由打包好的桌面应用来做：
 
 ```ts
-const version = await desktop.updates.appVersion()   // 壳的打包版本，如 '0.2.0'
-await desktop.updates.downloadApp()                 // 用系统浏览器打开发布页
-await desktop.updates.updateDsh('0.1.7-rc.1')       // pnpm 装指定版本（省略则装最高的）
-await desktop.updates.restartWeb()                   // 热重启 dsh web，桌面壳不退出
-desktop.updates.onPrompt((prompt) => { /* 用 DSH Modal 渲染 */ })
+const version = await desktop.updates.appVersion() // 壳的打包版本，如 '0.2.0'
+await desktop.updates.downloadApp() // 用系统浏览器打开发布页
+await desktop.updates.updateDsh('0.1.7-rc.1') // pnpm 装指定版本（省略则装最高的）
+await desktop.updates.restartWeb() // 热重启 dsh web，桌面壳不退出
+desktop.updates.onPrompt((prompt) => {
+  /* 用 DSH Modal 渲染 */
+})
 desktop.updates.ackPrompt(prompt.id)
-desktop.updates.respondPrompt(prompt.id, 'later')    // 或 'restart'
-desktop.updates.relaunch()                           // 重启整个桌面应用
+desktop.updates.respondPrompt(prompt.id, 'later') // 或 'restart'
+desktop.updates.relaunch() // 重启整个桌面应用
 ```
 
 要点：
@@ -74,11 +76,9 @@ desktop.updates.relaunch()                           // 重启整个桌面应用
 await desktop.seats.contribute({
   seat: 'applicationMenu',
   contributor: 'desktop-update',
-  menu: 'app',       // 或 'plugins'
+  menu: 'app', // 或 'plugins'
   order: 20,
-  items: [
-    { id: 'check-now', label: '检查更新…', accelerator: 'CmdOrCtrl+Shift+U' },
-  ],
+  items: [{ id: 'check-now', label: '检查更新…', accelerator: 'CmdOrCtrl+Shift+U' }],
 })
 await desktop.seats.contribute({
   seat: 'tray',
